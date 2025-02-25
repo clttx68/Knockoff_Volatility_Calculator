@@ -104,7 +104,10 @@ def get_current_price(ticker_obj):
     return todays_data['Close'][0] if not todays_data.empty else None
 
 def compute_recommendation(ticker):
-    """Compute all metrics for a single ticker, returning either a result dict or error string."""
+    """
+    Compute all metrics for a single ticker, returning either a result dict or error string.
+    Includes earliest-expiration ATM bid/ask + today's volume for liquidity checks.
+    """
     try:
         ticker = ticker.strip().upper()
         if not ticker:
@@ -136,9 +139,13 @@ def compute_recommendation(ticker):
         # Calculate ATM IV & find first straddle price
         atm_iv = {}
         straddle = None
-        # <<< NEW: We'll store the ATM call/put bid/ask from the earliest expiration
+        
+        # We'll store the ATM call/put info from the earliest expiration
         first_call_bid, first_call_ask = None, None
         first_put_bid, first_put_ask = None, None
+        # <<< NEW: We'll store today's volume
+        first_call_volume = None
+        first_put_volume = None
         
         i = 0
         for exp_date, chain in options_chains.items():
@@ -159,20 +166,19 @@ def compute_recommendation(ticker):
             atm_iv_value = (call_iv + put_iv) / 2.0
             atm_iv[exp_date] = atm_iv_value
             
-            # For the first expiration chain, capture straddle info
+            # For the first expiration chain, capture straddle & volumes
             if i == 0:
-                call_bid = calls.loc[call_idx, 'bid']
-                call_ask = calls.loc[call_idx, 'ask']
-                put_bid = puts.loc[put_idx, 'bid']
-                put_ask = puts.loc[put_idx, 'ask']
+                first_call_bid = calls.loc[call_idx, 'bid']
+                first_call_ask = calls.loc[call_idx, 'ask']
+                first_call_volume = calls.loc[call_idx, 'volume']  # <<< NEW
                 
-                # Save them for later display  # <<< NEW
-                first_call_bid, first_call_ask = call_bid, call_ask
-                first_put_bid, first_put_ask = put_bid, put_ask
+                first_put_bid = puts.loc[put_idx, 'bid']
+                first_put_ask = puts.loc[put_idx, 'ask']
+                first_put_volume = puts.loc[put_idx, 'volume']     # <<< NEW
                 
                 # Calculate straddle mid
-                call_mid = (call_bid + call_ask) / 2.0 if (call_bid is not None and call_ask is not None) else None
-                put_mid = (put_bid + put_ask) / 2.0 if (put_bid is not None and put_ask is not None) else None
+                call_mid = (first_call_bid + first_call_ask)/2.0 if (first_call_bid is not None and first_call_ask is not None) else None
+                put_mid = (first_put_bid + first_put_ask)/2.0 if (first_put_bid is not None and first_put_ask is not None) else None
                 if call_mid is not None and put_mid is not None:
                     straddle = call_mid + put_mid
             
@@ -212,7 +218,7 @@ def compute_recommendation(ticker):
         else:
             iv30_rv30 = iv30 / rv30
         
-        # 30-day average volume
+        # 30-day average volume (equities volume)
         avg_volume = price_history['Volume'].rolling(30).mean().dropna().iloc[-1]
         
         # Expected move from straddle
@@ -231,16 +237,20 @@ def compute_recommendation(ticker):
             'ts_slope_0_45_pass': ts_slope_0_45 <= -0.00406,
             'expected_move': expected_move,
             'expected_move_str': expected_move_str,
-            # <<< NEW: add the earliest-expiration call/put bid/ask for reference
+            
+            # Bid/Ask
             'atm_call_bid': first_call_bid,
             'atm_call_ask': first_call_ask,
             'atm_put_bid': first_put_bid,
             'atm_put_ask': first_put_ask,
+            
+            # <<< NEW: Volume
+            'atm_call_volume': first_call_volume,
+            'atm_put_volume': first_put_volume
         }
 
     except Exception as e:
         return f"Error: {str(e)}"
-
 
 def main():
     st.title("Options Screener (Rate Limited)")
@@ -257,10 +267,7 @@ def main():
                                     value="'AMC', 'CART', 'CAVA', 'CPNG'")
     
     if st.button("Clean Tickers"):
-        # Remove single quotes and double quotes
-        cleaned_text = raw_tickers_text.replace("'", "").replace('"', "")
-        # Remove brackets if any
-        cleaned_text = cleaned_text.replace("[", "").replace("]", "")
+        cleaned_text = raw_tickers_text.replace("'", "").replace('"', "").replace("[", "").replace("]", "")
         st.write("**Cleaned Tickers** (comma-separated):")
         st.code(cleaned_text.strip())
 
@@ -326,13 +333,16 @@ def main():
                 else:
                     recommendation = "Avoid"
 
-                # <<< NEW: Display ATM bid/ask
                 atm_call_ba = "N/A"
                 atm_put_ba = "N/A"
                 if r.get('atm_call_bid') is not None and r.get('atm_call_ask') is not None:
                     atm_call_ba = f"{r['atm_call_bid']} / {r['atm_call_ask']}"
                 if r.get('atm_put_bid') is not None and r.get('atm_put_ask') is not None:
                     atm_put_ba = f"{r['atm_put_bid']} / {r['atm_put_ask']}"
+
+                # <<< NEW: Add today's volume for ATM call & put
+                atm_call_vol = r['atm_call_volume'] if r.get('atm_call_volume') is not None else "N/A"
+                atm_put_vol  = r['atm_put_volume']  if r.get('atm_put_volume')  is not None else "N/A"
 
                 row = {
                     "Ticker": ticker,
@@ -342,8 +352,10 @@ def main():
                     "iv30_rv30": "PASS" if iv30rv30_bool else "FAIL",
                     "ts_slope":  "PASS" if slope_bool else "FAIL",
                     "Expected Move": emove_str,
-                    "ATM Call B/A": atm_call_ba,  # <<< NEW
-                    "ATM Put B/A": atm_put_ba,    # <<< NEW
+                    "ATM Call B/A": atm_call_ba,
+                    "ATM Put B/A": atm_put_ba,
+                    "ATM Call Vol": atm_call_vol,  # <<< NEW
+                    "ATM Put Vol": atm_put_vol     # <<< NEW
                 }
                 df_rows.append(row)
 
@@ -351,16 +363,13 @@ def main():
             st.subheader("Screen Results")
             st.dataframe(df, use_container_width=True)
 
-            # If any "Expected Move" is "N/A", it may be due to incomplete data
             if df["Expected Move"].eq("N/A").any():
                 st.warning("Some 'N/A' values may be due to incomplete yfinance data (often outside market hours).")
 
-        # Show error messages
         if error_results:
             st.subheader("Errors")
             for err in error_results:
                 st.error(err)
-
 
 if __name__ == "__main__":
     main()
