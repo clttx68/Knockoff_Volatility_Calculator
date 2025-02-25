@@ -18,24 +18,34 @@ import math
 import time  # for the 7-second delay
 
 # --------------------------------------------
-#  DARK MODE CSS OVERRIDE
+#  DARK MODE VIA INLINE CSS (Method 2)
 # --------------------------------------------
 st.set_page_config(page_title="Options Screener", layout="wide")
 st.markdown(
     """
     <style>
-    /* Force the page background to dark, and text to light */
-    body, .css-18e3th9, .css-1gk4psh {
-        background-color: #0E1117 !important;
-        color: #FFFFFF !important;
+    /* Main body + container */
+    body, .block-container {
+      background-color: #0E1117 !important;
+      color: #FFFFFF !important;
     }
-    /* Streamlit's main block background color */
-    .css-1offfwp {
-        background-color: #0E1117 !important;
+
+    /* Sidebars (if used) */
+    [data-testid="stSidebar"] {
+      background-color: #161b21 !important;
     }
-    /* Table text color */
-    .css-1ex1afd tr, .css-1ex1afd td, .css-1ex1afd th {
-        color: #FFFFFF !important;
+
+    /* Standard text (headers, paragraphs, etc.) */
+    h1, h2, h3, h4, h5, h6, p, label {
+      color: #FFFFFF !important;
+    }
+
+    /* DataFrame / Table text */
+    [data-testid="stDataFrame"] > div[data-testid="stHorizontalBlock"] {
+      color: #FFFFFF !important;
+    }
+    [data-testid="stTable"] {
+      color: #FFFFFF !important;
     }
     </style>
     """,
@@ -112,30 +122,6 @@ def build_term_structure(days, ivs):
 def get_current_price(ticker_obj):
     todays_data = ticker_obj.history(period='1d')
     return todays_data['Close'][0] if not todays_data.empty else None
-
-def get_next_friday(date_):
-    """Returns the upcoming Friday from the given date (including the same day if it's already Friday)."""
-    days_ahead = 4 - date_.weekday()  # Monday=0 ... Sunday=6
-    if days_ahead < 0:
-        days_ahead += 7
-    return date_ + timedelta(days=days_ahead)
-
-def get_next_friday_30_days(date_):
-    """Returns the Friday that's roughly 30 days after `date_`."""
-    date_30 = date_ + timedelta(days=30)
-    return get_next_friday(date_30)
-
-def custom_round(price, base=1, direction='down'):
-    """
-    Round `price` to the nearest multiple of `base`.
-    direction='down' => floor
-    direction='up'   => ceil
-    """
-    import math
-    if direction == 'down':
-        return math.floor(price / base) * base
-    else:
-        return math.ceil(price / base) * base
 
 def compute_recommendation(ticker):
     """Compute all metrics for a single ticker, returning either a result dict or error string."""
@@ -248,31 +234,19 @@ def compute_recommendation(ticker):
             expected_move = None
             expected_move_str = None
         
-        # IV/HV ratio, position sizing
-        iv_hv_ratio = iv30_rv30
-        risk_percentage = iv_hv_ratio * 100
-        risk_dollars_per_share = underlying_price * iv_hv_ratio
-        position_size = 1000 / risk_dollars_per_share if risk_dollars_per_share != 0 else None
-        
         return {
             'ticker': ticker,
             'share_price': underlying_price,
             'avg_volume_pass': avg_volume >= 1500000,
             'iv30_rv30_pass': iv30_rv30 >= 1.25,
             'ts_slope_0_45_pass': ts_slope_0_45 <= -0.00406,
-            'expected_move': expected_move,             # numeric
-            'expected_move_str': expected_move_str,     # string with '%'
-            'iv_hv_ratio': iv_hv_ratio,
-            'risk_percentage': risk_percentage,
-            'position_size': position_size
+            'expected_move': expected_move,
+            'expected_move_str': expected_move_str
         }
 
     except Exception as e:
         return f"Error: {str(e)}"
 
-# --------------------------------------------
-#  STREAMLIT MAIN
-# --------------------------------------------
 def main():
     st.title("Options Screener (Dark Mode + Rate Limit)")
     st.write("Enter one or more ticker symbols (comma‐separated), then click **Run**.")
@@ -285,7 +259,6 @@ def main():
             st.error("No valid tickers provided.")
             return
         
-        # We'll process tickers one at a time, sleeping 7 seconds after each
         n = len(tickers_list)
         progress_bar = st.progress(0)
         
@@ -301,17 +274,15 @@ def main():
                 else:
                     error_results.append(res)
 
-            # Update progress
             progress_val = int(((i + 1) / n) * 100)
             progress_bar.progress(progress_val)
             
-            # Sleep 7 seconds IF this isn't the last ticker
+            # Sleep 7 seconds IF not the last ticker
             if i < n - 1:
                 time.sleep(7)
         
-        # Once done, build a table
         if valid_results:
-            # Sort valid results by expected move descending (None at bottom)
+            # Sort by expected move
             def sort_key(item):
                 return item['expected_move'] if item['expected_move'] is not None else -9999999
             valid_results.sort(key=sort_key, reverse=True)
@@ -341,11 +312,7 @@ def main():
                     "avg_volume": "PASS" if avg_vol_bool else "FAIL",
                     "iv30_rv30": "PASS" if iv30rv30_bool else "FAIL",
                     "ts_slope":  "PASS" if slope_bool else "FAIL",
-                    "Expected Move": emove_str,
-                    "IV/HV Ratio": round(r['iv_hv_ratio'], 2),
-                    "Risk %": f"{round(r['risk_percentage'], 2)}%",
-                    "Position Size": (f"{round(r['position_size'])} shares"
-                                      if r['position_size'] else "N/A"),
+                    "Expected Move": emove_str
                 }
                 df_rows.append(row)
 
@@ -353,11 +320,10 @@ def main():
             st.subheader("Screen Results")
             st.dataframe(df, use_container_width=True)
 
-            # If any "Expected Move" is "N/A", warn user about possible outside market hours
+            # If any "Expected Move" is "N/A", show a warning
             if df["Expected Move"].eq("N/A").any():
                 st.warning("Some 'N/A' values may be due to incomplete yfinance data (often outside market hours).")
 
-        # Show error messages (if any)
         if error_results:
             st.subheader("Errors")
             for err in error_results:
@@ -365,3 +331,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
