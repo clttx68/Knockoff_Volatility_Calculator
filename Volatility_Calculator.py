@@ -55,13 +55,15 @@ def filter_dates(dates):
     raise ValueError("No date 45 days or more in the future found.")
 
 def yang_zhang(price_data, window=30, trading_periods=252, return_last_only=True):
+    """
+    Yang-Zhang volatility for a given historical price dataset.
+    """
     log_ho = (price_data['High'] / price_data['Open']).apply(np.log)
     log_lo = (price_data['Low'] / price_data['Open']).apply(np.log)
     log_co = (price_data['Close'] / price_data['Open']).apply(np.log)
     
     log_oc = (price_data['Open'] / price_data['Close'].shift(1)).apply(np.log)
     log_oc_sq = log_oc**2
-    
     log_cc = (price_data['Close'] / price_data['Close'].shift(1)).apply(np.log)
     log_cc_sq = log_cc**2
     
@@ -80,6 +82,9 @@ def yang_zhang(price_data, window=30, trading_periods=252, return_last_only=True
         return result.dropna()
 
 def build_term_structure(days, ivs):
+    """
+    Simple linear interpolation of IV vs DTE.
+    """
     days = np.array(days)
     ivs = np.array(ivs)
     
@@ -100,13 +105,18 @@ def build_term_structure(days, ivs):
     return term_spline
 
 def get_current_price(ticker_obj):
+    """
+    Returns today's close (or last available).
+    """
     todays_data = ticker_obj.history(period='1d')
     return todays_data['Close'][0] if not todays_data.empty else None
 
 def compute_recommendation(ticker):
     """
-    Compute all metrics for a single ticker, returning either a result dict or error string.
-    Includes earliest-expiration ATM bid/ask + today's volume for liquidity checks.
+    Compute all metrics for a single ticker, returning either a dict or an error string.
+
+    - ATM Straddle Premium is used as a naive "Potential Profit" measure if sold.
+    - Ignores margin requirements & unlimited risk.
     """
     try:
         ticker = ticker.strip().upper()
@@ -136,16 +146,13 @@ def compute_recommendation(ticker):
         if underlying_price is None:
             return "Error: Unable to retrieve underlying stock price."
         
-        # Calculate ATM IV & find first straddle price
+        # For storing data about the earliest expiration
         atm_iv = {}
-        straddle = None
         
-        # We'll store the ATM call/put info from the earliest expiration
-        first_call_bid, first_call_ask = None, None
-        first_put_bid, first_put_ask = None, None
-        # <<< NEW: We'll store today's volume
-        first_call_volume = None
-        first_put_volume = None
+        earliest_expiry_straddle = None
+        earliest_call_bid, earliest_call_ask = None, None
+        earliest_put_bid, earliest_put_ask = None, None
+        earliest_call_volume, earliest_put_volume = None, None
         
         i = 0
         for exp_date, chain in options_chains.items():
@@ -154,7 +161,7 @@ def compute_recommendation(ticker):
             if calls.empty or puts.empty:
                 continue
             
-            # Closest strike to underlying price
+            # Find the ATM strikes
             call_diffs = (calls['strike'] - underlying_price).abs()
             call_idx = call_diffs.idxmin()
             call_iv = calls.loc[call_idx, 'impliedVolatility']
@@ -163,31 +170,32 @@ def compute_recommendation(ticker):
             put_idx = put_diffs.idxmin()
             put_iv = puts.loc[put_idx, 'impliedVolatility']
             
+            # Average call/put IV for this expiration
             atm_iv_value = (call_iv + put_iv) / 2.0
             atm_iv[exp_date] = atm_iv_value
             
-            # For the first expiration chain, capture straddle & volumes
+            # For the 1st (earliest) expiration in the sorted list:
             if i == 0:
-                first_call_bid = calls.loc[call_idx, 'bid']
-                first_call_ask = calls.loc[call_idx, 'ask']
-                first_call_volume = calls.loc[call_idx, 'volume']  # <<< NEW
+                earliest_call_bid = calls.loc[call_idx, 'bid']
+                earliest_call_ask = calls.loc[call_idx, 'ask']
+                earliest_call_volume = calls.loc[call_idx, 'volume']
                 
-                first_put_bid = puts.loc[put_idx, 'bid']
-                first_put_ask = puts.loc[put_idx, 'ask']
-                first_put_volume = puts.loc[put_idx, 'volume']     # <<< NEW
+                earliest_put_bid = puts.loc[put_idx, 'bid']
+                earliest_put_ask = puts.loc[put_idx, 'ask']
+                earliest_put_volume = puts.loc[put_idx, 'volume']
                 
-                # Calculate straddle mid
-                call_mid = (first_call_bid + first_call_ask)/2.0 if (first_call_bid is not None and first_call_ask is not None) else None
-                put_mid = (first_put_bid + first_put_ask)/2.0 if (first_put_bid is not None and first_put_ask is not None) else None
+                # Compute straddle mid
+                call_mid = (earliest_call_bid + earliest_call_ask) / 2.0 if (earliest_call_bid and earliest_call_ask) else None
+                put_mid = (earliest_put_bid + earliest_put_ask) / 2.0 if (earliest_put_bid and earliest_put_ask) else None
                 if call_mid is not None and put_mid is not None:
-                    straddle = call_mid + put_mid
+                    earliest_expiry_straddle = call_mid + put_mid
             
             i += 1
         
         if not atm_iv:
             return "Error: Could not determine ATM IV for any expiration dates."
         
-        # Build term structure
+        # Build the term structure from all valid exp dates
         today = datetime.today().date()
         dtes = []
         ivs = []
@@ -218,56 +226,65 @@ def compute_recommendation(ticker):
         else:
             iv30_rv30 = iv30 / rv30
         
-        # 30-day average volume (equities volume)
+        # 30-day average volume (equity)
         avg_volume = price_history['Volume'].rolling(30).mean().dropna().iloc[-1]
         
-        # Expected move from straddle
-        if straddle and underlying_price != 0:
-            expected_move = round(straddle / underlying_price * 100, 2)
+        # "Expected move" from earliest-expiry straddle mid
+        if earliest_expiry_straddle and underlying_price != 0:
+            expected_move = round(earliest_expiry_straddle / underlying_price * 100, 2)
             expected_move_str = f"{expected_move}%"
         else:
-            expected_move = None
+            earliest_expiry_straddle = None
             expected_move_str = None
+        
+        # We'll treat the straddle premium as "potential profit" from a short straddle
+        # ignoring real-world risks & margin.
+        straddle_premium = earliest_expiry_straddle if earliest_expiry_straddle else 0.0
         
         return {
             'ticker': ticker,
             'share_price': underlying_price,
-            'avg_volume_pass': avg_volume >= 1500000,
+            'avg_volume_pass': avg_volume >= 1_500_000,
             'iv30_rv30_pass': iv30_rv30 >= 1.25,
             'ts_slope_0_45_pass': ts_slope_0_45 <= -0.00406,
-            'expected_move': expected_move,
             'expected_move_str': expected_move_str,
             
-            # Bid/Ask
-            'atm_call_bid': first_call_bid,
-            'atm_call_ask': first_call_ask,
-            'atm_put_bid': first_put_bid,
-            'atm_put_ask': first_put_ask,
+            # "Potential Profit($)" if you short the earliest-exp ATM straddle
+            'straddle_premium': straddle_premium,
             
-            # <<< NEW: Volume
-            'atm_call_volume': first_call_volume,
-            'atm_put_volume': first_put_volume
+            # Earliest-expiration ATM option details
+            'atm_call_bid': earliest_call_bid,
+            'atm_call_ask': earliest_call_ask,
+            'atm_put_bid': earliest_put_bid,
+            'atm_put_ask': earliest_put_ask,
+            'atm_call_volume': earliest_call_volume,
+            'atm_put_volume': earliest_put_volume
         }
 
     except Exception as e:
         return f"Error: {str(e)}"
 
+
 def main():
     st.title("Options Screener (Rate Limited)")
     st.write("Enter your stock tickers and run the screener. Because of yfinance limitations, "
              "we'll process them one at a time with a small delay.")
-
+    
     # --------------------------------------------
     # CLEANING SECTION
     # --------------------------------------------
     st.subheader("Ticker Cleaning Utility")
-    st.write("Paste text containing tickers in quotes (e.g. `'AMC', 'CART'`) and click **Clean Tickers** to remove quotes.")
+    st.write("Paste text containing tickers in quotes (e.g. `'AMC', 'CART'`) and click **Clean Tickers**.")
     
     raw_tickers_text = st.text_area("Paste tickers with quotes here:", 
                                     value="'AMC', 'CART', 'CAVA', 'CPNG'")
     
     if st.button("Clean Tickers"):
-        cleaned_text = raw_tickers_text.replace("'", "").replace('"', "").replace("[", "").replace("]", "")
+        cleaned_text = (raw_tickers_text
+                        .replace("'", "")
+                        .replace('"', "")
+                        .replace("[", "")
+                        .replace("]", ""))
         st.write("**Cleaned Tickers** (comma-separated):")
         st.code(cleaned_text.strip())
 
@@ -310,21 +327,19 @@ def main():
         
         # Once done, build a table
         if valid_results:
-            # Sort valid results by expected move descending (None goes to bottom)
-            def sort_key(item):
-                return item['expected_move'] if item['expected_move'] is not None else -9999999
-            valid_results.sort(key=sort_key, reverse=True)
-
             df_rows = []
             for r in valid_results:
                 ticker = r['ticker']
                 share_price = r['share_price']
+                
                 avg_vol_bool = r['avg_volume_pass']
                 iv30rv30_bool = r['iv30_rv30_pass']
                 slope_bool = r['ts_slope_0_45_pass']
-                emove_str = r['expected_move_str'] or "N/A"
                 
-                # Simple recommendation logic
+                emove_str = r['expected_move_str'] or "N/A"
+                sprem     = r.get('straddle_premium', 0.0)
+                
+                # Recommendation logic (as before)
                 if avg_vol_bool and iv30rv30_bool and slope_bool:
                     recommendation = "Recommended"
                 elif slope_bool and ((avg_vol_bool and not iv30rv30_bool) or 
@@ -332,34 +347,57 @@ def main():
                     recommendation = "Consider"
                 else:
                     recommendation = "Avoid"
-
-                atm_call_ba = "N/A"
-                atm_put_ba = "N/A"
+                
+                # Format ATM call/put B/A
                 if r.get('atm_call_bid') is not None and r.get('atm_call_ask') is not None:
-                    atm_call_ba = f"{r['atm_call_bid']} / {r['atm_call_ask']}"
+                    call_ba = f"{r['atm_call_bid']:.2f} / {r['atm_call_ask']:.2f}"
+                else:
+                    call_ba = "N/A"
+                
                 if r.get('atm_put_bid') is not None and r.get('atm_put_ask') is not None:
-                    atm_put_ba = f"{r['atm_put_bid']} / {r['atm_put_ask']}"
-
-                # <<< NEW: Add today's volume for ATM call & put
-                atm_call_vol = r['atm_call_volume'] if r.get('atm_call_volume') is not None else "N/A"
-                atm_put_vol  = r['atm_put_volume']  if r.get('atm_put_volume')  is not None else "N/A"
-
+                    put_ba = f"{r['atm_put_bid']:.2f} / {r['atm_put_ask']:.2f}"
+                else:
+                    put_ba = "N/A"
+                
+                call_vol = r['atm_call_volume'] if r.get('atm_call_volume') is not None else "N/A"
+                put_vol  = r['atm_put_volume']  if r.get('atm_put_volume')  is not None else "N/A"
+                
                 row = {
                     "Ticker": ticker,
-                    "Share Price": round(share_price, 2),
+                    "Share Price": round(share_price, 2) if share_price else "N/A",
                     "Recommendation": recommendation,
+                    
                     "avg_volume": "PASS" if avg_vol_bool else "FAIL",
                     "iv30_rv30": "PASS" if iv30rv30_bool else "FAIL",
                     "ts_slope":  "PASS" if slope_bool else "FAIL",
+                    
                     "Expected Move": emove_str,
-                    "ATM Call B/A": atm_call_ba,
-                    "ATM Put B/A": atm_put_ba,
-                    "ATM Call Vol": atm_call_vol,  # <<< NEW
-                    "ATM Put Vol": atm_put_vol     # <<< NEW
+                    "ATM Call B/A": call_ba,
+                    "ATM Put B/A": put_ba,
+                    "ATM Call Vol": call_vol,
+                    "ATM Put Vol": put_vol,
+                    
+                    # Potential profit from earliest-exp ATM straddle (if short)
+                    "Potential Profit($)": f"{sprem:.2f}" if sprem else "N/A"
                 }
+                
                 df_rows.append(row)
 
+            # Create DataFrame
             df = pd.DataFrame(df_rows)
+            
+            # Sort by biggest potential profit (optional)
+            def sort_key(item):
+                # We parse the "Potential Profit($)" if present
+                p_str = item["Potential Profit($)"]
+                try:
+                    return float(p_str)
+                except:
+                    return -9999999  
+            
+            df_sorted = sorted(df_rows, key=sort_key, reverse=True)
+            df = pd.DataFrame(df_sorted)
+            
             st.subheader("Screen Results")
             st.dataframe(df, use_container_width=True)
 
