@@ -1,12 +1,4 @@
-"""
-DISCLAIMER:
 
-This software is provided solely for educational and research purposes.
-It is not intended to provide investment advice, and no investment recommendations
-are made herein. The developers are not financial advisors and accept no responsibility
-for any financial decisions or losses resulting from the use of this software.
-Always consult a professional financial advisor before making any investment decisions.
-"""
 
 import streamlit as st
 import yfinance as yf
@@ -272,7 +264,7 @@ def compute_recommendation(ticker):
 def main():
     st.title("Options Screener (Dark Mode + Rate Limit)")
     st.write("Enter one or more ticker symbols (comma‐separated), then click **Run**.")
-    st.write("**Note:** This demo enforces a ~7 second wait per ticker to simulate rate limiting.")
+    st.write("**Note:** ratelimited by yfinance. Use during market hours. have fun. ")
 
     tickers_input = st.text_input("Tickers", value="AAPL, TSLA")
     if st.button("Run"):
