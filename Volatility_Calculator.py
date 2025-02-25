@@ -262,7 +262,7 @@ def compute_recommendation(ticker):
 #  STREAMLIT MAIN
 # --------------------------------------------
 def main():
-    st.title("Options Screener (Dark Mode + Rate Limit)")
+    st.title("Options Screener (Rate Limited)")
     st.write("Enter one or more ticker symbols (comma‐separated), then click **Run**.")
     st.write("**Note:** ratelimited by yfinance. Use during market hours. have fun. ")
 
