@@ -1,5 +1,3 @@
-
-
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -57,6 +55,9 @@ def filter_dates(dates):
     raise ValueError("No date 45 days or more in the future found.")
 
 def yang_zhang(price_data, window=30, trading_periods=252, return_last_only=True):
+    """
+    Yang-Zhang volatility estimator for historical volatility.
+    """
     log_ho = (price_data['High'] / price_data['Open']).apply(np.log)
     log_lo = (price_data['Low'] / price_data['Open']).apply(np.log)
     log_co = (price_data['Close'] / price_data['Open']).apply(np.log)
@@ -82,6 +83,9 @@ def yang_zhang(price_data, window=30, trading_periods=252, return_last_only=True
         return result.dropna()
 
 def build_term_structure(days, ivs):
+    """
+    Build a simple linear interpolation for ATM implied volatility vs. DTE (days to expiry).
+    """
     days = np.array(days)
     ivs = np.array(ivs)
     
@@ -102,20 +106,11 @@ def build_term_structure(days, ivs):
     return term_spline
 
 def get_current_price(ticker_obj):
+    """
+    Fetch the most recent close (today's close if available).
+    """
     todays_data = ticker_obj.history(period='1d')
     return todays_data['Close'][0] if not todays_data.empty else None
-
-def get_next_friday(date_):
-    """Returns the upcoming Friday from the given date (including the same day if it's already Friday)."""
-    days_ahead = 4 - date_.weekday()  # Monday=0 ... Sunday=6
-    if days_ahead < 0:
-        days_ahead += 7
-    return date_ + timedelta(days=days_ahead)
-
-def get_next_friday_30_days(date_):
-    """Returns the Friday that's roughly 30 days after `date_`."""
-    date_30 = date_ + timedelta(days=30)
-    return get_next_friday(date_30)
 
 def custom_round(price, base=1, direction='down'):
     """
@@ -129,7 +124,9 @@ def custom_round(price, base=1, direction='down'):
         return math.ceil(price / base) * base
 
 def compute_recommendation(ticker):
-    """Compute all metrics for a single ticker, returning either a result dict or error string."""
+    """
+    Compute all metrics for a single ticker, returning either a result dict or error string.
+    """
     try:
         ticker = ticker.strip().upper()
         if not ticker:
@@ -241,33 +238,55 @@ def compute_recommendation(ticker):
         
         # The ratio is kept for pass/fail logic but not displayed
         iv_hv_ratio = iv30_rv30  
-        risk_percentage = iv_hv_ratio * 100
-        risk_dollars_per_share = underlying_price * iv_hv_ratio
-        position_size = 1000 / risk_dollars_per_share if risk_dollars_per_share != 0 else None
         
         return {
             'ticker': ticker,
             'share_price': underlying_price,
-            'avg_volume_pass': avg_volume >= 1500000,
+            'avg_volume_pass': avg_volume >= 1_500_000,
             'iv30_rv30_pass': iv30_rv30 >= 1.25,
             'ts_slope_0_45_pass': ts_slope_0_45 <= -0.00406,
-            'expected_move': expected_move,             # numeric
-            'expected_move_str': expected_move_str      # string with '%'
+            'expected_move': expected_move,             
+            'expected_move_str': expected_move_str      
         }
 
     except Exception as e:
         return f"Error: {str(e)}"
 
-# --------------------------------------------
-#  STREAMLIT MAIN
-# --------------------------------------------
+
 def main():
     st.title("Options Screener (Rate Limited)")
-    st.write("Enter one or more ticker symbols (comma‐separated), then click **Run**.")
-    st.write("**Note:** ratelimited by yfinance. Use during market hours. have fun. ")
+    st.write("Enter your stock tickers and run the screener. Because of yfinance limitations, "
+             "we'll process them one at a time with a small delay.")
 
-    tickers_input = st.text_input("Tickers", value="AAPL, TSLA")
-    if st.button("Run"):
+    # --------------------------------------------
+    # CLEANING SECTION
+    # --------------------------------------------
+    st.subheader("Ticker Cleaning Utility")
+    st.write("Paste text containing tickers in quotes (e.g. `'AMC', 'CART', 'CAVA'`) and click **Clean Tickers** to remove quotes.")
+    
+    raw_tickers_text = st.text_area("Paste tickers with quotes here:", 
+                                    value="'AMC', 'CART', 'CAVA', 'CPNG', 'CZR', 'FSLR', 'INTU'")
+    
+    if st.button("Clean Tickers"):
+        # Remove single quotes and double quotes
+        cleaned_text = raw_tickers_text.replace("'", "").replace('"', "")
+        # Optional: you could handle any trailing spaces or brackets if needed
+        # For example, if you had something like ['AAPL','TSLA']:
+        cleaned_text = cleaned_text.replace("[", "").replace("]", "")
+        # Show the cleaned version
+        st.write("**Cleaned Tickers** (comma-separated):")
+        st.code(cleaned_text.strip())
+
+    st.write("---")
+    st.subheader("Run the Options Screener")
+
+    # Main tickers input
+    tickers_input = st.text_input(
+        "Tickers (comma‐separated, no quotes):",
+        value="AAPL, TSLA"
+    )
+
+    if st.button("Run Screener"):
         tickers_list = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
         if not tickers_list:
             st.error("No valid tickers provided.")
@@ -283,7 +302,6 @@ def main():
         for i, ticker in enumerate(tickers_list):
             with st.spinner(f"Processing {ticker} ({i+1}/{n})..."):
                 res = compute_recommendation(ticker)
-                
                 if isinstance(res, dict):
                     valid_results.append(res)
                 else:
@@ -299,7 +317,7 @@ def main():
         
         # Once done, build a table
         if valid_results:
-            # Sort valid results by expected move descending (None at bottom)
+            # Sort valid results by expected move descending (None goes to bottom)
             def sort_key(item):
                 return item['expected_move'] if item['expected_move'] is not None else -9999999
             valid_results.sort(key=sort_key, reverse=True)
@@ -313,7 +331,7 @@ def main():
                 slope_bool = r['ts_slope_0_45_pass']
                 emove_str = r['expected_move_str'] or "N/A"
                 
-                # Recommendation logic
+                # Simple recommendation logic
                 if avg_vol_bool and iv30rv30_bool and slope_bool:
                     recommendation = "Recommended"
                 elif slope_bool and ((avg_vol_bool and not iv30rv30_bool) or 
@@ -337,15 +355,17 @@ def main():
             st.subheader("Screen Results")
             st.dataframe(df, use_container_width=True)
 
-            # If any "Expected Move" is "N/A", warn user about possible outside market hours
+            # If any "Expected Move" is "N/A", it may be due to incomplete data (often outside market hours).
             if df["Expected Move"].eq("N/A").any():
                 st.warning("Some 'N/A' values may be due to incomplete yfinance data (often outside market hours).")
 
-        # Show error messages (if any)
+        # Show error messages
         if error_results:
             st.subheader("Errors")
             for err in error_results:
                 st.error(err)
 
+
 if __name__ == "__main__":
     main()
+
