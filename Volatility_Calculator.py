@@ -2,28 +2,24 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 from datetime import datetime, timedelta
-from scipy.interpolate import interp1d
 import numpy as np
 import math
-import time  # for the 7-second delay
+import time
 
 # --------------------------------------------
 #  DARK MODE CSS OVERRIDE
 # --------------------------------------------
-st.set_page_config(page_title="Options Screener", layout="wide")
+st.set_page_config(page_title="Call Calendar Screener", layout="wide")
 st.markdown(
     """
     <style>
-    /* Force the page background to dark, and text to light */
     body, .css-18e3th9, .css-1gk4psh {
         background-color: #0E1117 !important;
         color: #FFFFFF !important;
     }
-    /* Streamlit's main block background color */
     .css-1offfwp {
         background-color: #0E1117 !important;
     }
-    /* Table text color */
     .css-1ex1afd tr, .css-1ex1afd td, .css-1ex1afd th {
         color: #FFFFFF !important;
     }
@@ -35,88 +31,85 @@ st.markdown(
 # --------------------------------------------
 #  UTILITY FUNCTIONS
 # --------------------------------------------
-def filter_dates(dates):
-    today = datetime.today().date()
-    cutoff_date = today + timedelta(days=45)
-    
-    sorted_dates = sorted(datetime.strptime(date, "%Y-%m-%d").date() for date in dates)
-    arr = []
-    for i, date in enumerate(sorted_dates):
-        if date >= cutoff_date:
-            arr = [d.strftime("%Y-%m-%d") for d in sorted_dates[:i+1]]
-            break
-    
-    if len(arr) > 0:
-        # If the first found date is actually today, skip it.
-        if arr[0] == today.strftime("%Y-%m-%d"):
-            return arr[1:]
-        return arr
-
-    raise ValueError("No date 45 days or more in the future found.")
-
-def yang_zhang(price_data, window=30, trading_periods=252, return_last_only=True):
-    """
-    Yang-Zhang volatility for a given historical price dataset.
-    """
-    log_ho = (price_data['High'] / price_data['Open']).apply(np.log)
-    log_lo = (price_data['Low'] / price_data['Open']).apply(np.log)
-    log_co = (price_data['Close'] / price_data['Open']).apply(np.log)
-    
-    log_oc = (price_data['Open'] / price_data['Close'].shift(1)).apply(np.log)
-    log_oc_sq = log_oc**2
-    log_cc = (price_data['Close'] / price_data['Close'].shift(1)).apply(np.log)
-    log_cc_sq = log_cc**2
-    
-    rs = log_ho * (log_ho - log_co) + log_lo * (log_lo - log_co)
-    
-    close_vol = log_cc_sq.rolling(window=window, center=False).sum() * (1.0 / (window - 1.0))
-    open_vol = log_oc_sq.rolling(window=window, center=False).sum() * (1.0 / (window - 1.0))
-    window_rs = rs.rolling(window=window, center=False).sum() * (1.0 / (window - 1.0))
-    
-    k = 0.34 / (1.34 + ((window + 1) / (window - 1)))
-    result = (open_vol + k * close_vol + (1 - k) * window_rs).apply(np.sqrt) * np.sqrt(trading_periods)
-    
-    if return_last_only:
-        return result.iloc[-1]
-    else:
-        return result.dropna()
-
-def build_term_structure(days, ivs):
-    """
-    Simple linear interpolation of IV vs DTE.
-    """
-    days = np.array(days)
-    ivs = np.array(ivs)
-    
-    sort_idx = days.argsort()
-    days = days[sort_idx]
-    ivs = ivs[sort_idx]
-    
-    spline = interp1d(days, ivs, kind='linear', fill_value="extrapolate")
-    
-    def term_spline(dte):
-        if dte < days[0]:
-            return ivs[0]
-        elif dte > days[-1]:
-            return ivs[-1]
-        else:
-            return float(spline(dte))
-    
-    return term_spline
-
 def get_current_price(ticker_obj):
     """
     Returns today's close (or last available).
     """
-    todays_data = ticker_obj.history(period='1d')
-    return todays_data['Close'][0] if not todays_data.empty else None
+    data = ticker_obj.history(period='1d')
+    return data['Close'][0] if not data.empty else None
 
-def compute_recommendation(ticker):
+def pick_calendar_dates(expiration_strings):
     """
-    Compute all metrics for a single ticker, returning either a dict or an error string.
+    1) Convert all expiration date strings to date objects and sort ascending.
+    2) near_date: pick the earliest date >= 30 days from now. 
+       If none >=30, pick the largest date <30. 
+    3) far_date: pick the next date in the list after near_date.
+    Returns (near_date_str, far_date_str).
+    
+    If any step fails, raise ValueError.
+    """
+    today = datetime.today().date()
+    exps = sorted(datetime.strptime(d, "%Y-%m-%d").date() for d in expiration_strings)
+    
+    # Calculate DTE for each
+    dte_list = [(exp, (exp - today).days) for exp in exps if exp > today]
+    if not dte_list:
+        raise ValueError("No expirations in the future.")
+    
+    # Try to find the earliest date >=30 days
+    near_date = None
+    candidates_ge_30 = [x for x in dte_list if x[1] >= 30]
+    if candidates_ge_30:
+        # pick earliest among these
+        near_date = candidates_ge_30[0][0]
+    else:
+        # all are < 30 days, pick the furthest one
+        near_date = dte_list[-1][0]
+    
+    # now pick the next date strictly after near_date
+    # find near_date index in exps
+    idx = exps.index(near_date)
+    if idx == len(exps) - 1:
+        raise ValueError(f"No far expiration after near date={near_date}")
+    
+    far_date = exps[idx+1]
+    
+    return (near_date.strftime("%Y-%m-%d"), far_date.strftime("%Y-%m-%d"))
 
-    - ATM Straddle Premium is used as a naive "Potential Profit" measure if sold.
-    - Ignores margin requirements & unlimited risk.
+def compute_yang_zhang_volatility(history, window=30, trading_periods=252):
+    """
+    Yang-Zhang volatility (30-day window).
+    """
+    df = history.copy()
+    if len(df) < window:
+        return None
+    
+    log_ho = np.log(df['High'] / df['Open'])
+    log_lo = np.log(df['Low']  / df['Open'])
+    log_co = np.log(df['Close']/ df['Open'])
+    
+    log_oc = np.log(df['Open']/ df['Close'].shift(1))
+    log_cc = np.log(df['Close']/ df['Close'].shift(1))
+    
+    rs = log_ho * (log_ho - log_co) + log_lo * (log_lo - log_co)
+    
+    log_oc_sq = log_oc**2
+    log_cc_sq = log_cc**2
+    
+    close_vol = log_cc_sq.rolling(window=window).sum() * (1.0 / (window - 1.0))
+    open_vol  = log_oc_sq.rolling(window=window).sum() * (1.0 / (window - 1.0))
+    rs_term   = rs.rolling(window=window).sum()         * (1.0 / (window - 1.0))
+    
+    k = 0.34 / (1.34 + ((window + 1) / (window - 1)))
+    yz = (open_vol + k * close_vol + (1 - k) * rs_term).apply(np.sqrt) * np.sqrt(trading_periods)
+    return yz.dropna().iloc[-1] if len(yz.dropna())>0 else None
+
+def compute_calendar_recommendation(ticker):
+    """
+    1) Pick near_date (closest to ~30 days, or fallback) and the next far_date.
+    2) Find near & far call at the same ATM strike (closest to current price).
+    3) Compute net_debit = far_mid - near_mid.
+    4) Return pass/fail checks + data for display.
     """
     try:
         ticker = ticker.strip().upper()
@@ -124,157 +117,189 @@ def compute_recommendation(ticker):
             return "No stock symbol provided."
         
         stock = yf.Ticker(ticker)
-        
-        # Check if options exist
         if not stock.options:
-            return f"Error: No options found for stock symbol '{ticker}'."
+            return f"Error: No options found for '{ticker}'."
         
-        # Filter expiration dates
-        exp_dates = list(stock.options)
         try:
-            exp_dates = filter_dates(exp_dates)
-        except ValueError:
-            return "Error: Not enough option data (no suitable expiration dates)."
+            near_date_str, far_date_str = pick_calendar_dates(stock.options)
+        except ValueError as e:
+            return f"Error picking dates: {str(e)}"
         
-        # Retrieve option chains
-        options_chains = {}
-        for exp_date in exp_dates:
-            options_chains[exp_date] = stock.option_chain(exp_date)
+        # Option chains
+        near_chain = stock.option_chain(near_date_str)
+        far_chain  = stock.option_chain(far_date_str)
         
-        # Get underlying price
+        # Current stock price
         underlying_price = get_current_price(stock)
         if underlying_price is None:
-            return "Error: Unable to retrieve underlying stock price."
+            return f"Error: No underlying price for {ticker}."
         
-        # For storing data about the earliest expiration
-        atm_iv = {}
+        # ATM strike for near expiration
+        near_calls = near_chain.calls
+        if near_calls.empty:
+            return f"Error: No calls found for near expiration {near_date_str}."
         
-        earliest_expiry_straddle = None
-        earliest_call_bid, earliest_call_ask = None, None
-        earliest_put_bid, earliest_put_ask = None, None
-        earliest_call_volume, earliest_put_volume = None, None
+        call_diffs = (near_calls['strike'] - underlying_price).abs()
+        near_call_idx = call_diffs.idxmin()
+        atm_strike = near_calls.loc[near_call_idx, 'strike']
         
-        i = 0
-        for exp_date, chain in options_chains.items():
-            calls = chain.calls
-            puts = chain.puts
-            if calls.empty or puts.empty:
-                continue
-            
-            # Find the ATM strikes
-            call_diffs = (calls['strike'] - underlying_price).abs()
-            call_idx = call_diffs.idxmin()
-            call_iv = calls.loc[call_idx, 'impliedVolatility']
-            
-            put_diffs = (puts['strike'] - underlying_price).abs()
-            put_idx = put_diffs.idxmin()
-            put_iv = puts.loc[put_idx, 'impliedVolatility']
-            
-            # Average call/put IV for this expiration
-            atm_iv_value = (call_iv + put_iv) / 2.0
-            atm_iv[exp_date] = atm_iv_value
-            
-            # For the 1st (earliest) expiration in the sorted list:
-            if i == 0:
-                earliest_call_bid = calls.loc[call_idx, 'bid']
-                earliest_call_ask = calls.loc[call_idx, 'ask']
-                earliest_call_volume = calls.loc[call_idx, 'volume']
-                
-                earliest_put_bid = puts.loc[put_idx, 'bid']
-                earliest_put_ask = puts.loc[put_idx, 'ask']
-                earliest_put_volume = puts.loc[put_idx, 'volume']
-                
-                # Compute straddle mid
-                call_mid = (earliest_call_bid + earliest_call_ask) / 2.0 if (earliest_call_bid and earliest_call_ask) else None
-                put_mid = (earliest_put_bid + earliest_put_ask) / 2.0 if (earliest_put_bid and earliest_put_ask) else None
-                if call_mid is not None and put_mid is not None:
-                    earliest_expiry_straddle = call_mid + put_mid
-            
-            i += 1
+        # The far expiration's call at the same strike
+        far_calls = far_chain.calls
+        if far_calls.empty:
+            return f"Error: No calls found for far expiration {far_date_str}."
         
-        if not atm_iv:
-            return "Error: Could not determine ATM IV for any expiration dates."
+        # Filter to the same strike
+        same_strike_df = far_calls[far_calls['strike'] == atm_strike]
+        if same_strike_df.empty:
+            return f"Error: Far expiration {far_date_str} doesn't have strike {atm_strike}."
         
-        # Build the term structure from all valid exp dates
+        far_call = same_strike_df.iloc[0]  # in case there's only one row
+        
+        # near leg data
+        near_bid  = near_calls.loc[near_call_idx, 'bid']
+        near_ask  = near_calls.loc[near_call_idx, 'ask']
+        near_vol  = near_calls.loc[near_call_idx, 'volume']
+        
+        # far leg data
+        far_bid   = far_call['bid']
+        far_ask   = far_call['ask']
+        far_vol   = far_call['volume']
+        
+        def mid(bid, ask):
+            if pd.isna(bid) or pd.isna(ask):
+                return None
+            return (bid + ask)/2.0
+        
+        near_mid = mid(near_bid, near_ask)
+        far_mid  = mid(far_bid,  far_ask)
+        
+        if near_mid is None or far_mid is None:
+            return "Error: Missing bid/ask data for calls. Can't compute mid."
+        
+        net_debit = far_mid - near_mid
+        
+        # Additional checks: 
+        # - Average daily volume (equity), 
+        # - IV30>RV30, 
+        # - negative term-structure slope? (optional).
+        
+        # Historical price data for 3 mo
+        hist = stock.history(period="3mo")
+        if len(hist) < 30:
+            return "Error: Not enough historical data for IV/RV checks."
+        
+        # 30-day average equity volume
+        avg_equity_vol = hist['Volume'].rolling(30).mean().dropna()
+        if avg_equity_vol.empty:
+            return "Error: Not enough data to compute 30-day average volume."
+        eq_30day_avg = avg_equity_vol.iloc[-1]
+        
+        # Yang-Zhang realized vol
+        rv30 = compute_yang_zhang_volatility(hist, window=30)
+        if rv30 is None or rv30==0:
+            return "Error: RV30 not computable."
+        
+        # A quick approach for IV30: 
+        # We'll gather implied vol for all calls at all expirations, do a small interpolation around 30 DTE
+        # (This is a simplified approach, you could refine it further.)
+        # Gather all expiration dates, build day->IV
+        # We'll pick the ATM call's IV from each chain (for simplicity).
+        
+        exps = sorted(datetime.strptime(d, "%Y-%m-%d").date() for d in stock.options)
+        iv_map = {}
         today = datetime.today().date()
-        dtes = []
-        ivs = []
-        for exp_date, iv in atm_iv.items():
-            exp_date_obj = datetime.strptime(exp_date, "%Y-%m-%d").date()
-            days_to_expiry = (exp_date_obj - today).days
-            dtes.append(days_to_expiry)
-            ivs.append(iv)
         
-        term_spline = build_term_structure(dtes, ivs)
+        for d in exps:
+            chain = stock.option_chain(d.strftime("%Y-%m-%d"))
+            calls = chain.calls
+            if calls.empty:
+                continue
+            # ATM for that expiration
+            diffs = (calls['strike'] - underlying_price).abs()
+            idx = diffs.idxmin()
+            if pd.isna(idx):
+                continue
+            iv_val = calls.loc[idx, 'impliedVolatility']
+            if pd.isna(iv_val):
+                continue
+            dte = (d - today).days
+            iv_map[dte] = iv_val
         
-        # Compute slope between earliest DTE and 45 DTE
-        first_dte = dtes[0]
+        if not iv_map:
+            return "Error: No valid ATM call IV data for building IV30."
+        
+        # Build simple day->iv interpolation
+        dtes = list(iv_map.keys())
+        ivs  = [iv_map[d] for d in dtes]
+        
+        # Sort them
+        sorted_pairs = sorted(zip(dtes, ivs), key=lambda x: x[0])
+        dtes_sorted, ivs_sorted = zip(*sorted_pairs)
+        dtes_arr = np.array(dtes_sorted)
+        ivs_arr  = np.array(ivs_sorted)
+        
+        # We'll do a simple linear interpolation
+        from scipy.interpolate import interp1d
+        spline = interp1d(dtes_arr, ivs_arr, kind='linear', fill_value="extrapolate")
+        
+        def iv_estimate(dte):
+            if dte < dtes_arr[0]:
+                return ivs_arr[0]
+            elif dte > dtes_arr[-1]:
+                return ivs_arr[-1]
+            return float(spline(dte))
+        
+        iv30 = iv_estimate(30)
+        
+        # IV30>RV30 pass
+        iv30_rv30_pass = (iv30/rv30 >= 1.25)
+        
+        # Term structure slope: compare earliest DTE to 45 DTE
+        first_dte = dtes_arr[0]
         if first_dte >= 45:
-            ts_slope_0_45 = 0.0
+            slope_pass = False  # or interpret slope as 0? your call.
+            slope_value = 0
         else:
-            ts_slope_0_45 = (term_spline(45) - term_spline(first_dte)) / (45 - first_dte)
+            slope_value = (iv_estimate(45) - iv_estimate(first_dte)) / (45 - first_dte)
+            # e.g. pass if slope is negative enough
+            slope_pass = (slope_value <= -0.00406)
         
-        # Compute IV30 / RV30
-        price_history = stock.history(period='3mo')
-        if len(price_history) < 30:
-            return "Error: Not enough historical data to compute Yang-Zhang volatility."
-        
-        iv30 = term_spline(30)
-        rv30 = yang_zhang(price_history)
-        if rv30 == 0:
-            iv30_rv30 = float('inf')
-        else:
-            iv30_rv30 = iv30 / rv30
-        
-        # 30-day average volume (equity)
-        avg_volume = price_history['Volume'].rolling(30).mean().dropna().iloc[-1]
-        
-        # "Expected move" from earliest-expiry straddle mid
-        if earliest_expiry_straddle and underlying_price != 0:
-            expected_move = round(earliest_expiry_straddle / underlying_price * 100, 2)
-            expected_move_str = f"{expected_move}%"
-        else:
-            earliest_expiry_straddle = None
-            expected_move_str = None
-        
-        # We'll treat the straddle premium as "potential profit" from a short straddle
-        # ignoring real-world risks & margin.
-        straddle_premium = earliest_expiry_straddle if earliest_expiry_straddle else 0.0
+        # 1.5 million daily equity volume pass/fail
+        avg_vol_pass = (eq_30day_avg >= 1_500_000)
         
         return {
-            'ticker': ticker,
-            'share_price': underlying_price,
-            'avg_volume_pass': avg_volume >= 1_500_000,
-            'iv30_rv30_pass': iv30_rv30 >= 1.25,
-            'ts_slope_0_45_pass': ts_slope_0_45 <= -0.00406,
-            'expected_move_str': expected_move_str,
+            "ticker": ticker,
+            "share_price": underlying_price,
+            "near_expiration": near_date_str,
+            "far_expiration": far_date_str,
+            "calendar_strike": atm_strike,
             
-            # "Potential Profit($)" if you short the earliest-exp ATM straddle
-            'straddle_premium': straddle_premium,
+            "near_call_bid": near_bid,
+            "near_call_ask": near_ask,
+            "near_call_vol": near_vol,
             
-            # Earliest-expiration ATM option details
-            'atm_call_bid': earliest_call_bid,
-            'atm_call_ask': earliest_call_ask,
-            'atm_put_bid': earliest_put_bid,
-            'atm_put_ask': earliest_put_ask,
-            'atm_call_volume': earliest_call_volume,
-            'atm_put_volume': earliest_put_volume
+            "far_call_bid": far_bid,
+            "far_call_ask": far_ask,
+            "far_call_vol": far_vol,
+            
+            "net_debit": net_debit,
+            
+            # pass/fail checks
+            "avg_volume_pass": avg_vol_pass,
+            "iv30_rv30_pass": iv30_rv30_pass,
+            "ts_slope_0_45_pass": slope_pass,
+            "ts_slope_value": slope_value,  # might be interesting to see
         }
 
-    except Exception as e:
-        return f"Error: {str(e)}"
+    except Exception as ex:
+        return f"Error for {ticker}: {str(ex)}"
 
 
 def main():
-    st.title("Options Screener (Rate Limited)")
-    st.write("Enter your stock tickers and run the screener. Because of yfinance limitations, "
-             "we'll process them one at a time with a small delay.")
-    
-    # --------------------------------------------
-    # CLEANING SECTION
-    # --------------------------------------------
+    st.title("Call Calendar Screener (~30 days → next expiration)")
+
     st.subheader("Ticker Cleaning Utility")
-    st.write("Paste text containing tickers in quotes (e.g. `'AMC', 'CART'`) and click **Clean Tickers**.")
+    st.write("Paste text containing tickers in quotes (e.g. `'AAPL', 'TSLA'`) and click **Clean Tickers**.")
     
     raw_tickers_text = st.text_area("Paste tickers with quotes here:", 
                                     value="'AMC', 'CART', 'CAVA', 'CPNG'")
@@ -289,9 +314,8 @@ def main():
         st.code(cleaned_text.strip())
 
     st.write("---")
-    st.subheader("Run the Options Screener")
+    st.subheader("Run the Calendar Screener")
 
-    # Main tickers input
     tickers_input = st.text_input(
         "Tickers (comma‐separated, no quotes):",
         value="AAPL, TSLA"
@@ -306,108 +330,100 @@ def main():
         n = len(tickers_list)
         progress_bar = st.progress(0)
         
-        valid_results = []
-        error_results = []
+        results = []
+        errors = []
         
         for i, ticker in enumerate(tickers_list):
             with st.spinner(f"Processing {ticker} ({i+1}/{n})..."):
-                res = compute_recommendation(ticker)
+                res = compute_calendar_recommendation(ticker)
                 if isinstance(res, dict):
-                    valid_results.append(res)
+                    results.append(res)
                 else:
-                    error_results.append(res)
+                    errors.append(res)
 
-            # Update progress
-            progress_val = int(((i + 1) / n) * 100)
+            # update progress
+            progress_val = int(((i + 1)/n)*100)
             progress_bar.progress(progress_val)
             
-            # Sleep 7 seconds IF this isn't the last ticker
-            if i < n - 1:
-                time.sleep(7)
-        
-        # Once done, build a table
-        if valid_results:
-            df_rows = []
-            for r in valid_results:
-                ticker = r['ticker']
-                share_price = r['share_price']
+            if i < n-1:
+                time.sleep(7)  # 7-second delay to avoid yfinance rate-limits
+
+        # Build final table
+        if results:
+            rows = []
+            for r in results:
+                ticker      = r["ticker"]
+                share_price = r["share_price"]
+                near_exp    = r["near_expiration"]
+                far_exp     = r["far_expiration"]
+                strike      = r["calendar_strike"]
                 
-                avg_vol_bool = r['avg_volume_pass']
-                iv30rv30_bool = r['iv30_rv30_pass']
-                slope_bool = r['ts_slope_0_45_pass']
+                near_call_ba = (f"{r['near_call_bid']:.2f} / {r['near_call_ask']:.2f}"
+                                if not pd.isna(r['near_call_bid']) and not pd.isna(r['near_call_ask'])
+                                else "N/A")
+                far_call_ba  = (f"{r['far_call_bid']:.2f} / {r['far_call_ask']:.2f}"
+                                if not pd.isna(r['far_call_bid']) and not pd.isna(r['far_call_ask'])
+                                else "N/A")
                 
-                emove_str = r['expected_move_str'] or "N/A"
-                sprem     = r.get('straddle_premium', 0.0)
+                near_vol = r["near_call_vol"] if not pd.isna(r["near_call_vol"]) else 0
+                far_vol  = r["far_call_vol"]  if not pd.isna(r["far_call_vol"])  else 0
                 
-                # Recommendation logic (as before)
-                if avg_vol_bool and iv30rv30_bool and slope_bool:
+                net_debit = r["net_debit"]
+                
+                # pass/fail flags
+                vol_pass     = r["avg_volume_pass"]
+                iv30rv30_pas = r["iv30_rv30_pass"]
+                slope_pass   = r["ts_slope_0_45_pass"]
+                
+                # Simple recommendation logic
+                if vol_pass and iv30rv30_pas and slope_pass:
                     recommendation = "Recommended"
-                elif slope_bool and ((avg_vol_bool and not iv30rv30_bool) or 
-                                     (iv30rv30_bool and not avg_vol_bool)):
+                elif slope_pass and ((vol_pass and not iv30rv30_pas) or 
+                                     (iv30rv30_pas and not vol_pass)):
                     recommendation = "Consider"
                 else:
                     recommendation = "Avoid"
                 
-                # Format ATM call/put B/A
-                if r.get('atm_call_bid') is not None and r.get('atm_call_ask') is not None:
-                    call_ba = f"{r['atm_call_bid']:.2f} / {r['atm_call_ask']:.2f}"
-                else:
-                    call_ba = "N/A"
-                
-                if r.get('atm_put_bid') is not None and r.get('atm_put_ask') is not None:
-                    put_ba = f"{r['atm_put_bid']:.2f} / {r['atm_put_ask']:.2f}"
-                else:
-                    put_ba = "N/A"
-                
-                call_vol = r['atm_call_volume'] if r.get('atm_call_volume') is not None else "N/A"
-                put_vol  = r['atm_put_volume']  if r.get('atm_put_volume')  is not None else "N/A"
-                
                 row = {
                     "Ticker": ticker,
                     "Share Price": round(share_price, 2) if share_price else "N/A",
-                    "Recommendation": recommendation,
+                    "Near Exp": near_exp,
+                    "Far Exp":  far_exp,
+                    "Strike":   strike,
                     
-                    "avg_volume": "PASS" if avg_vol_bool else "FAIL",
-                    "iv30_rv30": "PASS" if iv30rv30_bool else "FAIL",
-                    "ts_slope":  "PASS" if slope_bool else "FAIL",
+                    "Near Call B/A": near_call_ba,
+                    "Near Call Vol": near_vol,
                     
-                    "Expected Move": emove_str,
-                    "ATM Call B/A": call_ba,
-                    "ATM Put B/A": put_ba,
-                    "ATM Call Vol": call_vol,
-                    "ATM Put Vol": put_vol,
+                    "Far Call B/A":  far_call_ba,
+                    "Far Call Vol":  far_vol,
                     
-                    # Potential profit from earliest-exp ATM straddle (if short)
-                    "Potential Profit($)": f"{sprem:.2f}" if sprem else "N/A"
+                    "Net Debit($)":  f"{net_debit:.2f}" if net_debit else "N/A",
+                    "avg_volume":    "PASS" if vol_pass else "FAIL",
+                    "iv30_rv30":     "PASS" if iv30rv30_pas else "FAIL",
+                    "ts_slope":      "PASS" if slope_pass else "FAIL",
+                    
+                    "Recommendation": recommendation
                 }
-                
-                df_rows.append(row)
-
-            # Create DataFrame
-            df = pd.DataFrame(df_rows)
+                rows.append(row)
             
-            # Sort by biggest potential profit (optional)
-            def sort_key(item):
-                # We parse the "Potential Profit($)" if present
-                p_str = item["Potential Profit($)"]
+            # sort by net debit ascending, for instance
+            def sort_key(d):
+                val_str = d["Net Debit($)"]
                 try:
-                    return float(p_str)
+                    return float(val_str)
                 except:
-                    return -9999999  
+                    return 9999999  # 'N/A' goes last
+            rows_sorted = sorted(rows, key=sort_key)
             
-            df_sorted = sorted(df_rows, key=sort_key, reverse=True)
-            df = pd.DataFrame(df_sorted)
-            
-            st.subheader("Screen Results")
+            df = pd.DataFrame(rows_sorted)
+            st.subheader("Calendar Screener Results")
             st.dataframe(df, use_container_width=True)
 
-            if df["Expected Move"].eq("N/A").any():
-                st.warning("Some 'N/A' values may be due to incomplete yfinance data (often outside market hours).")
-
-        if error_results:
+        if errors:
             st.subheader("Errors")
-            for err in error_results:
-                st.error(err)
+            for e in errors:
+                st.error(e)
+
 
 if __name__ == "__main__":
     main()
