@@ -10,11 +10,41 @@ Always consult a professional financial advisor before making any investment dec
 
 import streamlit as st
 import yfinance as yf
+import pandas as pd
 from datetime import datetime, timedelta
 from scipy.interpolate import interp1d
 import numpy as np
 import math
+import time  # for the 7-second delay
 
+# --------------------------------------------
+#  DARK MODE CSS OVERRIDE
+# --------------------------------------------
+st.set_page_config(page_title="Options Screener", layout="wide")
+st.markdown(
+    """
+    <style>
+    /* Force the page background to dark, and text to light */
+    body, .css-18e3th9, .css-1gk4psh {
+        background-color: #0E1117 !important;
+        color: #FFFFFF !important;
+    }
+    /* Streamlit's main block background color */
+    .css-1offfwp {
+        background-color: #0E1117 !important;
+    }
+    /* Table text color */
+    .css-1ex1afd tr, .css-1ex1afd td, .css-1ex1afd th {
+        color: #FFFFFF !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+# --------------------------------------------
+#  UTILITY FUNCTIONS
+# --------------------------------------------
 def filter_dates(dates):
     today = datetime.today().date()
     cutoff_date = today + timedelta(days=45)
@@ -85,8 +115,7 @@ def get_current_price(ticker_obj):
 
 def get_next_friday(date_):
     """Returns the upcoming Friday from the given date (including the same day if it's already Friday)."""
-    # Monday=0 ... Sunday=6, so Friday=4
-    days_ahead = 4 - date_.weekday()
+    days_ahead = 4 - date_.weekday()  # Monday=0 ... Sunday=6
     if days_ahead < 0:
         days_ahead += 7
     return date_ + timedelta(days=days_ahead)
@@ -102,18 +131,19 @@ def custom_round(price, base=1, direction='down'):
     direction='down' => floor
     direction='up'   => ceil
     """
+    import math
     if direction == 'down':
         return math.floor(price / base) * base
     else:
         return math.ceil(price / base) * base
 
 def compute_recommendation(ticker):
+    """Compute all metrics for a single ticker, returning either a result dict or error string."""
     try:
         ticker = ticker.strip().upper()
         if not ticker:
             return "No stock symbol provided."
         
-        # Create yfinance Ticker object
         stock = yf.Ticker(ticker)
         
         # Check if options exist
@@ -137,23 +167,22 @@ def compute_recommendation(ticker):
         if underlying_price is None:
             return "Error: Unable to retrieve underlying stock price."
         
-        # Calculate ATM IV at each expiration date & find first straddle price
+        # Calculate ATM IV & find first straddle price
         atm_iv = {}
         straddle = None
         i = 0
         for exp_date, chain in options_chains.items():
             calls = chain.calls
             puts = chain.puts
-            
             if calls.empty or puts.empty:
                 continue
             
-            # Closest call to underlying_price
+            # Closest call
             call_diffs = (calls['strike'] - underlying_price).abs()
             call_idx = call_diffs.idxmin()
             call_iv = calls.loc[call_idx, 'impliedVolatility']
             
-            # Closest put to underlying_price
+            # Closest put
             put_diffs = (puts['strike'] - underlying_price).abs()
             put_idx = put_diffs.idxmin()
             put_iv = puts.loc[put_idx, 'impliedVolatility']
@@ -170,7 +199,6 @@ def compute_recommendation(ticker):
                 
                 call_mid = (call_bid + call_ask) / 2.0 if (call_bid is not None and call_ask is not None) else None
                 put_mid = (put_bid + put_ask) / 2.0 if (put_bid is not None and put_ask is not None) else None
-                
                 if call_mid is not None and put_mid is not None:
                     straddle = (call_mid + put_mid)
             i += 1
@@ -201,6 +229,7 @@ def compute_recommendation(ticker):
         price_history = stock.history(period='3mo')
         if len(price_history) < 30:
             return "Error: Not enough historical data to compute Yang-Zhang volatility."
+        
         iv30 = term_spline(30)
         rv30 = yang_zhang(price_history)
         if rv30 == 0:
@@ -208,10 +237,10 @@ def compute_recommendation(ticker):
         else:
             iv30_rv30 = iv30 / rv30
         
-        # Compute average volume (30-day rolling average)
+        # 30-day average volume
         avg_volume = price_history['Volume'].rolling(30).mean().dropna().iloc[-1]
         
-        # Compute expected move from the first straddle
+        # Expected move from straddle
         if straddle and underlying_price != 0:
             expected_move = round(straddle / underlying_price * 100, 2)
             expected_move_str = f"{expected_move}%"
@@ -219,82 +248,84 @@ def compute_recommendation(ticker):
             expected_move = None
             expected_move_str = None
         
-        # Compute IV/HV ratio and position size
+        # IV/HV ratio, position sizing
         iv_hv_ratio = iv30_rv30
         risk_percentage = iv_hv_ratio * 100
         risk_dollars_per_share = underlying_price * iv_hv_ratio
         position_size = 1000 / risk_dollars_per_share if risk_dollars_per_share != 0 else None
         
-        result_dict = {
+        return {
             'ticker': ticker,
             'share_price': underlying_price,
             'avg_volume_pass': avg_volume >= 1500000,
             'iv30_rv30_pass': iv30_rv30 >= 1.25,
             'ts_slope_0_45_pass': ts_slope_0_45 <= -0.00406,
-            'expected_move': expected_move,
-            'expected_move_str': expected_move_str,
+            'expected_move': expected_move,             # numeric
+            'expected_move_str': expected_move_str,     # string with '%'
             'iv_hv_ratio': iv_hv_ratio,
             'risk_percentage': risk_percentage,
             'position_size': position_size
         }
-        return result_dict
 
     except Exception as e:
         return f"Error: {str(e)}"
 
-def run_recommendations(tickers):
-    if not isinstance(tickers, (list, tuple)):
-        return ["Error: 'tickers' should be a list or tuple of stock symbols."]
-    
-    results = []
-    for ticker in tickers:
-        result = compute_recommendation(ticker)
-        results.append(result)
-
-    valid_results = []
-    error_results = []
-
-    # Separate valid (dict) from errors (strings)
-    for res in results:
-        if isinstance(res, dict):
-            valid_results.append(res)
-        else:
-            error_results.append(res)
-
-    # Sort valid results by expected move (descending), None at bottom
-    def sort_key(item):
-        return item['expected_move'] if item['expected_move'] is not None else -9999999
-    valid_results.sort(key=sort_key, reverse=True)
-
-    return valid_results, error_results
-
+# --------------------------------------------
+#  STREAMLIT MAIN
+# --------------------------------------------
 def main():
-    st.title("Options Screener")
+    st.title("Options Screener (Dark Mode + Rate Limit)")
     st.write("Enter one or more ticker symbols (comma‐separated), then click **Run**.")
+    st.write("**Note:** This demo enforces a ~7 second wait per ticker to simulate rate limiting.")
 
     tickers_input = st.text_input("Tickers", value="AAPL, TSLA")
     if st.button("Run"):
-        # Convert comma‐separated to list
         tickers_list = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
         if not tickers_list:
             st.error("No valid tickers provided.")
             return
         
-        valid_results, error_results = run_recommendations(tickers_list)
+        # We'll process tickers one at a time, sleeping 7 seconds after each
+        n = len(tickers_list)
+        progress_bar = st.progress(0)
         
+        valid_results = []
+        error_results = []
+        
+        for i, ticker in enumerate(tickers_list):
+            with st.spinner(f"Processing {ticker} ({i+1}/{n})..."):
+                res = compute_recommendation(ticker)
+                
+                if isinstance(res, dict):
+                    valid_results.append(res)
+                else:
+                    error_results.append(res)
+
+            # Update progress
+            progress_val = int(((i + 1) / n) * 100)
+            progress_bar.progress(progress_val)
+            
+            # Sleep 7 seconds IF this isn't the last ticker
+            if i < n - 1:
+                time.sleep(7)
+        
+        # Once done, build a table
         if valid_results:
-            st.subheader("Screen Results")
+            # Sort valid results by expected move descending (None at bottom)
+            def sort_key(item):
+                return item['expected_move'] if item['expected_move'] is not None else -9999999
+            valid_results.sort(key=sort_key, reverse=True)
+
+            df_rows = []
             for r in valid_results:
                 ticker = r['ticker']
                 share_price = r['share_price']
                 avg_vol_bool = r['avg_volume_pass']
                 iv30rv30_bool = r['iv30_rv30_pass']
                 slope_bool = r['ts_slope_0_45_pass']
-                emove = r['expected_move_str']
-                iv_hv_ratio = r['iv_hv_ratio']
-                risk_percentage = r['risk_percentage']
-                position_size = r['position_size']
-
+                emove_str = r['expected_move_str'] or "N/A"
+                
+                # Recommendation logic
                 if avg_vol_bool and iv30rv30_bool and slope_bool:
                     recommendation = "Recommended"
                 elif slope_bool and ((avg_vol_bool and not iv30rv30_bool) or 
@@ -303,26 +334,34 @@ def main():
                 else:
                     recommendation = "Avoid"
 
-                st.write(f"**Ticker:** {ticker}")
-                st.write(f"  - Share Price: {share_price:.2f}")
-                st.write(f"  - Recommendation: **{recommendation}**")
-                st.write(f"    - avg_volume: {'PASS' if avg_vol_bool else 'FAIL'}")
-                st.write(f"    - iv30_rv30: {'PASS' if iv30rv30_bool else 'FAIL'}")
-                st.write(f"    - ts_slope:  {'PASS' if slope_bool else 'FAIL'}")
-                st.write(f"    - Expected Move: {emove if emove else 'N/A'}")
-                st.write(f"    - IV/HV Ratio: {iv_hv_ratio:.2f}  (≈ {risk_percentage:.2f}% risk)")
-                if position_size is not None:
-                    st.write(f"    - Position Size: {position_size:.0f} shares if risking $1000")
-                else:
-                    st.write("    - Position Size: N/A")
+                row = {
+                    "Ticker": ticker,
+                    "Share Price": round(share_price, 2),
+                    "Recommendation": recommendation,
+                    "avg_volume": "PASS" if avg_vol_bool else "FAIL",
+                    "iv30_rv30": "PASS" if iv30rv30_bool else "FAIL",
+                    "ts_slope":  "PASS" if slope_bool else "FAIL",
+                    "Expected Move": emove_str,
+                    "IV/HV Ratio": round(r['iv_hv_ratio'], 2),
+                    "Risk %": f"{round(r['risk_percentage'], 2)}%",
+                    "Position Size": (f"{round(r['position_size'])} shares"
+                                      if r['position_size'] else "N/A"),
+                }
+                df_rows.append(row)
 
-                st.write("---")
-        
+            df = pd.DataFrame(df_rows)
+            st.subheader("Screen Results")
+            st.dataframe(df, use_container_width=True)
+
+            # If any "Expected Move" is "N/A", warn user about possible outside market hours
+            if df["Expected Move"].eq("N/A").any():
+                st.warning("Some 'N/A' values may be due to incomplete yfinance data (often outside market hours).")
+
+        # Show error messages (if any)
         if error_results:
             st.subheader("Errors")
             for err in error_results:
                 st.error(err)
-
 
 if __name__ == "__main__":
     main()
